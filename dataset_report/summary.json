@@ -1,0 +1,15 @@
+{
+  "total_files": 6,
+  "pass": 4,
+  "review": 0,
+  "fail": 2,
+  "sample_rate_distribution": {
+    "44100": 5,
+    "0": 1
+  },
+  "channel_distribution": {
+    "1.0": 5,
+    "nan": 1
+  },
+  "note": "PASS/REVIEW/FAIL are heuristic checks, not a guarantee that audio is suitable for every model."
+}
