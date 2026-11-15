@@ -1,2 +1,10 @@
-# exclude audio_dataset/* and dataset_report/*
+# Audio data & generated reports
+audio_dataset/
+dataset_report/
+_extracted_dataset/
 
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
