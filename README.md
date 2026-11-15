@@ -42,8 +42,8 @@ pip install -r requirements.txt
 Pass either a directory or a ZIP archive:
 
 ```bash
-python checker.py ./audio_dataset --output ./dataset_report
-python checker.py ./audio_dataset.zip --output ./dataset_report
+python main.py --input ./audio_dataset --output ./dataset_report
+python main.py --input ./audio_dataset.zip --output ./dataset_report
 ```
 
 Optional `metadata.csv` can be placed anywhere inside the dataset. It should contain a `filename` or `path` column. Optional columns include `transcript`, `speaker_id`, and `language`.
@@ -66,4 +66,14 @@ clip002.wav,How are you?,speaker_2,en
 - Optional metadata row and transcript presence
 
 `PASS`, `REVIEW`, and `FAIL` are simple heuristics. They do not prove that a transcript is correct or that a recording is suitable for a particular model. Keep the original dataset unchanged.
+
+## Tests
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The tests generate a small WAV in a temporary directory and verify the CLI
+arguments and FFmpeg command construction without launching FFmpeg or FFprobe.
 
