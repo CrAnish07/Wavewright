@@ -22,7 +22,7 @@ def ffmpeg_decode_to_raw_float32(path: Path) -> list[str]:
 def main():
     # Parse args
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", require=True)
+    parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="dataset_report")
     args = parser.parse_args()
 
