@@ -58,3 +58,70 @@ def test_main_requires_input(monkeypatch, capsys):
 
     assert error.value.code == 2
     assert "following arguments are required: --input" in capsys.readouterr().err
+
+
+def test_check_duplicate_waves_finds_identical_files(tmp_path):
+    from main import check_duplicate_waves
+
+    content = b"same audio content"
+
+    file1 = tmp_path / "audio1.wav"
+    file2 = tmp_path / "audio2.wav"
+
+    file1.write_bytes(content)
+    file2.write_bytes(content)
+
+    result = check_duplicate_waves(tmp_path)
+
+    assert len(result) == 1
+    assert list(result.values()) == [[file1, file2]]
+
+
+def test_check_duplicate_waves_ignores_unique_files(tmp_path):
+    from main import check_duplicate_waves
+
+    (tmp_path / "audio1.wav").write_bytes(b"audio one")
+    (tmp_path / "audio2.wav").write_bytes(b"audio two")
+
+    result = check_duplicate_waves(tmp_path)
+
+    assert result == {}
+
+
+def test_check_duplicate_waves_searches_nested_directories(tmp_path):
+    from main import check_duplicate_waves
+
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+
+    file1 = tmp_path / "audio1.wav"
+    file2 = nested_dir / "audio2.mp3"
+
+    file1.write_bytes(b"identical audio")
+    file2.write_bytes(b"identical audio")
+
+    result = check_duplicate_waves(tmp_path)
+
+    assert len(result) == 1
+    assert list(result.values()) == [[file1, file2]]
+
+
+def test_check_duplicate_waves_ignores_unsupported_extensions(tmp_path):
+    from main import check_duplicate_waves
+
+    (tmp_path / "file1.txt").write_bytes(b"same content")
+    (tmp_path / "file2.txt").write_bytes(b"same content")
+
+    result = check_duplicate_waves(tmp_path)
+
+    assert result == {}
+
+
+def test_check_duplicate_waves_rejects_invalid_directory(tmp_path):
+    import pytest
+    from main import check_duplicate_waves
+
+    invalid_path = tmp_path / "does_not_exist"
+
+    with pytest.raises(NotADirectoryError):
+        check_duplicate_waves(invalid_path)
