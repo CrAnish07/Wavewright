@@ -1,5 +1,6 @@
 # Audio data & generated reports
 audio_dataset/
+sample_audio/
 dataset_report/
 _extracted_dataset/
 

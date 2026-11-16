@@ -53,6 +53,7 @@ def ffmpeg_decode_to_raw_float32(path: Path) -> list[str]:
         "-nostdin",
         "-v",
         "error",
+        "-xerror",
         "-i",
         str(path),
         "-map",
@@ -63,6 +64,21 @@ def ffmpeg_decode_to_raw_float32(path: Path) -> list[str]:
         "pcm_f32le",
         "pipe:1",
     ]
+
+
+def is_decodable_audio(path: Path) -> bool:
+    """Return whether FFmpeg can decode the first audio stream without errors."""
+    try:
+        result = subprocess.run(
+            ffmpeg_decode_to_raw_float32(path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg is required to validate audio files.") from None
+
+    return result.returncode == 0
 
 
 # Audio extensions
@@ -144,12 +160,23 @@ def main():
                 if p.resolve() != keeper:
                     duplicate_paths.add(p.resolve())
 
-        """ Unique files = all files minus the duplicate copies """
+        """Exclude duplicates and files that FFmpeg cannot fully decode."""
+        decodable_files = []
+        corrupted_paths = []
+        for path in all_audio_files:
+            if is_decodable_audio(path):
+                decodable_files.append(path)
+            else:
+                corrupted_paths.append(path)
+
         audio_file_set = [
-            p.resolve() for p in all_audio_files if p.resolve() not in duplicate_paths
+            p.resolve() for p in decodable_files if p.resolve() not in duplicate_paths
         ]
 
         print(f"\nTotal audio files found: {len(all_audio_files)}")
+        print(f"Corrupted or undecodable files skipped: {len(corrupted_paths)}")
+        for path in corrupted_paths:
+            print(f"  {path}")
         print(f"Duplicate copies skipped: {len(duplicate_paths)}")
         print(f"Unique audio files in audio_file_set: {len(audio_file_set)}")
         for p in audio_file_set:
