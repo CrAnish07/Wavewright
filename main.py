@@ -2,9 +2,9 @@ import argparse
 import hashlib
 import subprocess
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
-
 
 # Utilities
 def last_updated_file_from_duplicate(path_list: list[str | Path]) -> Path | None:
@@ -97,26 +97,44 @@ AUDIO_EXTENSIONS = {
 
 
 # Check duplicates audio waves via sha 256
+
 def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     """Return groups of audio files with identical contents, keyed by SHA-256."""
     directory = Path(directory_path)
     if not directory.is_dir():
         raise NotADirectoryError(f"Not a directory: {directory}")
 
-    files_by_hash: dict[str, list[Path]] = {}
+    # Find supported audio files recursively.
+    audio_files = [
+        path
+        for path in sorted(directory.rglob("*"))
+        if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+    ]
 
-    # Recursively searches the directory
-    for path in sorted(directory.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-
+    def hash_file(path: Path) -> tuple[str, Path]:
+        """Calculate the SHA-256 hash of one audio file."""
         digest = hashlib.sha256()
+
         with path.open("rb") as audio_file:
+            # Read in chunks to avoid loading entire audio files into memory.
             for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
                 digest.update(chunk)
-        files_by_hash.setdefault(digest.hexdigest(), []).append(path)
 
-    return {digest: paths for digest, paths in files_by_hash.items() if len(paths) > 1}
+        return digest.hexdigest(), path
+
+    files_by_hash: dict[str, list[Path]] = {}
+
+    # Hash multiple files concurrently using worker threads.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for file_hash, path in executor.map(hash_file, audio_files):
+            files_by_hash.setdefault(file_hash, []).append(path)
+
+    return {
+        file_hash: paths
+        for file_hash, paths in files_by_hash.items()
+        if len(paths) > 1
+    }
+
 
 
 def main():
