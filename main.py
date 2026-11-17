@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import subprocess
+import os
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -97,7 +98,6 @@ AUDIO_EXTENSIONS = {
 
 
 # Check duplicates audio waves via sha 256
-
 def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     """Return groups of audio files with identical contents, keyed by SHA-256."""
     directory = Path(directory_path)
@@ -110,6 +110,14 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
         for path in sorted(directory.rglob("*"))
         if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
     ]
+
+    # Nothing to hash -> nothing to return.
+    if not audio_files:
+        return {}
+
+    # Derive worker count from CPU count (I/O-bound work) and cap by file count.
+    max_workers = min(32, (os.cpu_count() or 1) * 4)
+    max_workers = max(1, min(max_workers, len(audio_files)))
 
     def hash_file(path: Path) -> tuple[str, Path]:
         """Calculate the SHA-256 hash of one audio file."""
@@ -125,7 +133,7 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     files_by_hash: dict[str, list[Path]] = {}
 
     # Hash multiple files concurrently using worker threads.
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for file_hash, path in executor.map(hash_file, audio_files):
             files_by_hash.setdefault(file_hash, []).append(path)
 
