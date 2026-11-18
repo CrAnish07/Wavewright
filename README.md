@@ -65,6 +65,13 @@ clip002.wav,How are you?,speaker_2,en
 - Exact duplicates using SHA-256
 - Optional metadata row and transcript presence
 
+After duplicate copies and undecodable files are removed, the scanner writes
+one record per remaining audio file, in scan order, to `<output>/manifest.json`.
+Each record includes a SHA-256 file ID, source path relative to the current
+working directory (`$PWD`), file size and UTC modification time, plus a `probe` object containing
+container metadata, audio stream details, and audio/video stream counts. Missing
+FFprobe fields are recorded as `null` (or an empty tags object).
+
 `PASS`, `REVIEW`, and `FAIL` are simple heuristics. They do not prove that a transcript is correct or that a recording is suitable for a particular model. Keep the original dataset unchanged.
 
 ## Tests
