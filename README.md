@@ -26,7 +26,7 @@ Ubuntu/Debian:
 
 ```bash
 sudo apt update
-sudo apt install ffmpeg python3-venv
+sudo apt install ffmpeg libchromaprint-tools python3-venv
 ```
 
 Python dependencies:
@@ -62,7 +62,7 @@ clip002.wav,How are you?,speaker_2,en
 - Duration, codec, sample rate, channels, and channel layout
 - Approximate silent-frame ratio
 - Approximate clipped-frame ratio
-- Exact duplicates using SHA-256
+- Exact duplicates using SHA-256 and cross-format duplicates using Chromaprint (`fpcalc`)
 - Optional metadata row and transcript presence
 
 After duplicate copies and undecodable files are removed, the scanner writes
@@ -71,6 +71,15 @@ Each record includes a SHA-256 file ID, source path relative to the current
 working directory (`$PWD`), file size and UTC modification time, plus a `probe` object containing
 container metadata, audio stream details, and audio/video stream counts. Missing
 FFprobe fields are recorded as `null` (or an empty tags object).
+
+Duplicate scanning first groups byte-identical files by SHA-256, then uses
+`fpcalc` fingerprints to compare the remaining files. Acoustic matches require
+at least 0.80 Chromaprint similarity and durations within 20% of each other.
+When Chromaprint produces no fingerprint (common for silence, very short clips,
+and synthetic tones), a strict decoded-audio signal comparison is used instead.
+Install `fpcalc` (provided by `libchromaprint-tools` on Ubuntu/Debian) for
+cross-format matching. If it is missing or cannot fingerprint a file, the scan
+reports a warning and still completes exact SHA-256 duplicate detection.
 
 `PASS`, `REVIEW`, and `FAIL` are simple heuristics. They do not prove that a transcript is correct or that a recording is suitable for a particular model. Keep the original dataset unchanged.
 

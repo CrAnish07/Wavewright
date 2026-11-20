@@ -3,6 +3,8 @@ import hashlib
 import json
 import subprocess
 import os
+import math
+from array import array
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -180,9 +182,118 @@ AUDIO_EXTENSIONS = {
 }
 
 
-# Check duplicates audio waves via sha 256
+# Acoustic match settings. The frame comparison tolerates small encoding noise
+# and alignment shifts while requiring a strong overall match.
+CHROMAPRINT_SIMILARITY_THRESHOLD = 0.80
+CHROMAPRINT_MAX_BIT_ERROR = 2
+CHROMAPRINT_MAX_ALIGN_OFFSET = 120
+CHROMAPRINT_MIN_FRAMES = 15
+
+
+def chromaprint_command(path: Path) -> list[str]:
+    return ["fpcalc", "-raw", "-json", str(path)]
+
+
+def _read_chromaprint(path: Path) -> tuple[float, list[int]]:
+    """Generate a raw Chromaprint fingerprint using the fpcalc executable."""
+    try:
+        result = subprocess.run(
+            chromaprint_command(path), capture_output=True, text=True, check=False
+        )
+    except FileNotFoundError:
+        raise RuntimeError("Chromaprint fpcalc is required for acoustic deduplication.") from None
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"fpcalc failed for {path}")
+    try:
+        data = json.loads(result.stdout)
+        duration = float(data["duration"])
+        fingerprint = [int(value) for value in data["fingerprint"]]
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Could not parse fpcalc output for {path}: {error}") from error
+    if not fingerprint:
+        raise RuntimeError(f"fpcalc returned an empty fingerprint for {path}")
+    return duration, fingerprint
+
+
+def _read_spectral_fingerprint(path: Path) -> tuple[float, list[float]]:
+    """Build a small decoded-audio fingerprint when Chromaprint has no result.
+
+    This handles very short or synthetic material (for example pure test tones)
+    that Chromaprint intentionally leaves fingerprintless.
+    """
+    command = [
+        "ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
+        "-map", "0:a:0", "-t", "120", "-ac", "1", "-ar", "11025",
+        "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg is required for the short-audio fallback.") from None
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode(errors="replace").strip() or f"FFmpeg failed for {path}")
+
+    samples = array("f")
+    samples.frombytes(result.stdout)
+    if len(samples) < 2048:
+        raise RuntimeError(f"Not enough decoded audio for a fallback fingerprint: {path}")
+    duration = len(samples) / 11025
+    # Compare temporal RMS and zero-crossing summaries. These remain stable
+    # across lossless and lossy encodings for short/simple signals.
+    segment_count = 20
+    raw_features: list[tuple[float, float]] = []
+    for index in range(segment_count):
+        start = index * len(samples) // segment_count
+        end = (index + 1) * len(samples) // segment_count
+        segment = samples[start:end]
+        if not segment:
+            raw_features.append((0.0, 0.0))
+            continue
+        energy = sum(float(value) * float(value) for value in segment) / len(segment)
+        crossings = sum(
+            1 for left, right in zip(segment, segment[1:])
+            if (left < 0 <= right) or (right < 0 <= left)
+        )
+        raw_features.append((math.sqrt(energy), crossings / max(1, len(segment) - 1)))
+    rms_scale = max((rms for rms, _ in raw_features), default=0.0)
+    feature = []
+    for rms, crossings in raw_features:
+        feature.extend((rms / rms_scale if rms_scale else 0.0, crossings))
+    return duration, feature
+
+
+def _chromaprint_similarity(first: list[int] | list[float], second: list[int] | list[float]) -> float:
+    """Return an alignment-tolerant Chromaprint frame similarity score."""
+    if len(first) == 40 and len(second) == 40:
+        first_crossing_rate = sum(first[1::2]) / 20
+        second_crossing_rate = sum(second[1::2]) / 20
+        crossing_scale = max(first_crossing_rate, second_crossing_rate, 1e-9)
+        # A normalized RMS profile alone makes different steady tones look
+        # alike. Keep a tight frequency-content gate for this fallback path.
+        if abs(first_crossing_rate - second_crossing_rate) / crossing_scale > 0.08:
+            return 0.0
+        first_norm = math.sqrt(sum(value * value for value in first))
+        second_norm = math.sqrt(sum(value * value for value in second))
+        if first_norm == 0.0 or second_norm == 0.0:
+            return 1.0 if first_norm == second_norm else 0.0
+        dot_product = sum(left * right for left, right in zip(first, second))
+        return dot_product / (first_norm * second_norm)
+    if min(len(first), len(second)) < CHROMAPRINT_MIN_FRAMES:
+        return 0.0
+    counts: dict[int, int] = {}
+    for i, first_frame in enumerate(first):
+        start = max(0, i - CHROMAPRINT_MAX_ALIGN_OFFSET)
+        end = min(len(second), i + CHROMAPRINT_MAX_ALIGN_OFFSET + 1)
+        for j in range(start, end):
+            if (first_frame ^ second[j]).bit_count() <= CHROMAPRINT_MAX_BIT_ERROR:
+                offset = i - j
+                counts[offset] = counts.get(offset, 0) + 1
+    return max(counts.values(), default=0) / min(len(first), len(second))
+
+
+# Check duplicates through an exact hash pass followed by acoustic matching.
 def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
-    """Return groups of audio files with identical contents, keyed by SHA-256."""
+    """Return exact and acoustically matching audio groups."""
     directory = Path(directory_path)
     if not directory.is_dir():
         raise NotADirectoryError(f"Not a directory: {directory}")
@@ -220,11 +331,83 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
         for file_hash, path in executor.map(hash_file, audio_files):
             files_by_hash.setdefault(file_hash, []).append(path)
 
-    return {
-        file_hash: paths
+    duplicates: dict[str, list[Path]] = {
+        f"sha256:{file_hash}": paths
         for file_hash, paths in files_by_hash.items()
         if len(paths) > 1
     }
+
+    # Fingerprint one representative per SHA group, including representatives
+    # from exact-duplicate groups so cross-format copies can match those groups.
+    candidates = [paths[0] for paths in files_by_hash.values()]
+    hash_by_representative = {
+        paths[0]: file_hash for file_hash, paths in files_by_hash.items()
+    }
+    if not candidates:
+        return duplicates
+
+    def fingerprint_file(path: Path) -> tuple[Path, tuple[float, list[int] | list[float]] | None, str | None]:
+        try:
+            return path, _read_chromaprint(path), None
+        except RuntimeError as error:
+            try:
+                return path, _read_spectral_fingerprint(path), None
+            except RuntimeError as fallback_error:
+                return path, None, f"{error}; fallback failed: {fallback_error}"
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(candidates))) as executor:
+        fingerprint_results = list(executor.map(fingerprint_file, candidates))
+
+    fingerprints: list[tuple[Path, float, list[int] | list[float]]] = []
+    failures = []
+    for path, result, error in fingerprint_results:
+        if result is None:
+            failures.append(f"{path}: {error}")
+        else:
+            duration, fingerprint = result
+            fingerprints.append((path, duration, fingerprint))
+    if failures:
+        print("Warning: acoustic deduplication skipped for some files:")
+        for failure in failures:
+            print(f"  {failure}")
+
+    # Compare candidates to group representatives; this avoids transitive
+    # chaining that could combine files which do not directly match.
+    group_number = 0
+    remaining = list(fingerprints)
+    while remaining:
+        representative = remaining.pop(0)
+        group = [representative[0]]
+        unmatched = []
+        for candidate in remaining:
+            duration_ratio = min(representative[1], candidate[1]) / max(
+                representative[1], candidate[1], 1.0
+            )
+            similarity = _chromaprint_similarity(representative[2], candidate[2])
+            if len(representative[2]) == 40:
+                match_threshold = 0.98
+            else:
+                match_threshold = CHROMAPRINT_SIMILARITY_THRESHOLD
+            if duration_ratio >= 0.80 and similarity >= match_threshold:
+                group.append(candidate[0])
+            else:
+                unmatched.append(candidate)
+        remaining = unmatched
+        if len(group) > 1:
+            group_number += 1
+            grouped_hashes = {hash_by_representative[path] for path in group}
+            expanded_group = [
+                path
+                for file_hash in grouped_hashes
+                for path in files_by_hash[file_hash]
+            ]
+            # Replace overlapping SHA groups with one unified duplicate group
+            # so the keeper selection sees every copy exactly once.
+            for file_hash in grouped_hashes:
+                duplicates.pop(f"sha256:{file_hash}", None)
+            duplicates[f"chromaprint:{group_number}"] = sorted(expanded_group)
+
+    return duplicates
 
 
 
@@ -247,7 +430,7 @@ def main():
         if duplicates:
             print("Duplicate audio files found:")
             for digest, paths in duplicates.items():
-                print(f"SHA-256 {digest}")
+                print(f"{digest}")
                 for path in paths:
                     print(f" {path}")
         else:
