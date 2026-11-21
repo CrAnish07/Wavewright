@@ -4,6 +4,7 @@ import json
 import subprocess
 import os
 import math
+import sys
 from array import array
 
 from concurrent.futures import ThreadPoolExecutor
@@ -191,16 +192,16 @@ CHROMAPRINT_MIN_FRAMES = 15
 
 
 def chromaprint_command(path: Path) -> list[str]:
-    return ["fpcalc", "-raw", "-json", str(path)]
+    return ["fpcalc", "-raw", "-json", "-length", "0", str(path.resolve())]
 
 
-def _read_chromaprint(path: Path) -> tuple[float, list[int]]:
+def _read_chromaprint(path: Path) -> tuple[float, str, list[int], array | None]:
     """Generate a raw Chromaprint fingerprint using the fpcalc executable."""
     try:
         result = subprocess.run(
             chromaprint_command(path), capture_output=True, text=True, check=False
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         raise RuntimeError("Chromaprint fpcalc is required for acoustic deduplication.") from None
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"fpcalc failed for {path}")
@@ -210,12 +211,12 @@ def _read_chromaprint(path: Path) -> tuple[float, list[int]]:
         fingerprint = [int(value) for value in data["fingerprint"]]
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not parse fpcalc output for {path}: {error}") from error
-    if not fingerprint:
-        raise RuntimeError(f"fpcalc returned an empty fingerprint for {path}")
-    return duration, fingerprint
+    if len(fingerprint) < CHROMAPRINT_MIN_FRAMES:
+        raise RuntimeError(f"fpcalc returned a fingerprint that is too short for {path}")
+    return duration, "chromaprint", fingerprint, None
 
 
-def _read_spectral_fingerprint(path: Path) -> tuple[float, list[float]]:
+def _read_spectral_fingerprint(path: Path) -> tuple[float, str, list[float], array]:
     """Build a small decoded-audio fingerprint when Chromaprint has no result.
 
     This handles very short or synthetic material (for example pure test tones)
@@ -235,6 +236,8 @@ def _read_spectral_fingerprint(path: Path) -> tuple[float, list[float]]:
 
     samples = array("f")
     samples.frombytes(result.stdout)
+    if sys.byteorder == "big":
+        samples.byteswap()
     if len(samples) < 2048:
         raise RuntimeError(f"Not enough decoded audio for a fallback fingerprint: {path}")
     duration = len(samples) / 11025
@@ -259,25 +262,13 @@ def _read_spectral_fingerprint(path: Path) -> tuple[float, list[float]]:
     feature = []
     for rms, crossings in raw_features:
         feature.extend((rms / rms_scale if rms_scale else 0.0, crossings))
-    return duration, feature
+    # Keep a lightly downsampled waveform for a direct similarity check after
+    # the coarse RMS/zero-crossing features identify a possible match.
+    return duration, "decoded", feature, samples[::8]
 
 
-def _chromaprint_similarity(first: list[int] | list[float], second: list[int] | list[float]) -> float:
+def _chromaprint_similarity(first: list[int], second: list[int]) -> float:
     """Return an alignment-tolerant Chromaprint frame similarity score."""
-    if len(first) == 40 and len(second) == 40:
-        first_crossing_rate = sum(first[1::2]) / 20
-        second_crossing_rate = sum(second[1::2]) / 20
-        crossing_scale = max(first_crossing_rate, second_crossing_rate, 1e-9)
-        # A normalized RMS profile alone makes different steady tones look
-        # alike. Keep a tight frequency-content gate for this fallback path.
-        if abs(first_crossing_rate - second_crossing_rate) / crossing_scale > 0.08:
-            return 0.0
-        first_norm = math.sqrt(sum(value * value for value in first))
-        second_norm = math.sqrt(sum(value * value for value in second))
-        if first_norm == 0.0 or second_norm == 0.0:
-            return 1.0 if first_norm == second_norm else 0.0
-        dot_product = sum(left * right for left, right in zip(first, second))
-        return dot_product / (first_norm * second_norm)
     if min(len(first), len(second)) < CHROMAPRINT_MIN_FRAMES:
         return 0.0
     counts: dict[int, int] = {}
@@ -289,6 +280,42 @@ def _chromaprint_similarity(first: list[int] | list[float], second: list[int] | 
                 offset = i - j
                 counts[offset] = counts.get(offset, 0) + 1
     return max(counts.values(), default=0) / min(len(first), len(second))
+
+
+def _decoded_feature_similarity(first: list[float], second: list[float]) -> float:
+    """Compare the normalized coarse features used to shortlist fallback pairs."""
+    first_crossing_rate = sum(first[1::2]) / 20
+    second_crossing_rate = sum(second[1::2]) / 20
+    crossing_scale = max(first_crossing_rate, second_crossing_rate, 1e-9)
+    if abs(first_crossing_rate - second_crossing_rate) / crossing_scale > 0.08:
+        return 0.0
+    first_norm = math.sqrt(sum(value * value for value in first))
+    second_norm = math.sqrt(sum(value * value for value in second))
+    if first_norm == 0.0 or second_norm == 0.0:
+        return 1.0 if first_norm == second_norm else 0.0
+    return sum(left * right for left, right in zip(first, second)) / (first_norm * second_norm)
+
+
+def _decoded_signal_similarity(first: array, second: array) -> float:
+    """Verify fallback matches against aligned decoded samples."""
+    overlap_size = min(len(first), len(second))
+    if overlap_size < 256:
+        return 0.0
+    max_lag = min(138, max(0, overlap_size // 5))
+    best = 0.0
+    for lag in range(-max_lag, max_lag + 1, 4):
+        start_a, start_b = max(0, lag), max(0, -lag)
+        size = min(len(first) - start_a, len(second) - start_b)
+        if size < overlap_size * 0.8:
+            continue
+        dot = sum(first[start_a + i] * second[start_b + i] for i in range(size))
+        norm_a = math.sqrt(sum(first[start_a + i] ** 2 for i in range(size)))
+        norm_b = math.sqrt(sum(second[start_b + i] ** 2 for i in range(size)))
+        if norm_a and norm_b:
+            best = max(best, dot / (norm_a * norm_b))
+        elif norm_a == norm_b:
+            best = max(best, 1.0)
+    return best
 
 
 # Check duplicates through an exact hash pass followed by acoustic matching.
@@ -346,7 +373,7 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     if not candidates:
         return duplicates
 
-    def fingerprint_file(path: Path) -> tuple[Path, tuple[float, list[int] | list[float]] | None, str | None]:
+    def fingerprint_file(path: Path) -> tuple[Path, tuple[float, str, list[int] | list[float], array | None] | None, str | None]:
         try:
             return path, _read_chromaprint(path), None
         except RuntimeError as error:
@@ -358,14 +385,14 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     with ThreadPoolExecutor(max_workers=min(max_workers, len(candidates))) as executor:
         fingerprint_results = list(executor.map(fingerprint_file, candidates))
 
-    fingerprints: list[tuple[Path, float, list[int] | list[float]]] = []
+    fingerprints: list[tuple[Path, float, str, list[int] | list[float], array | None]] = []
     failures = []
     for path, result, error in fingerprint_results:
         if result is None:
             failures.append(f"{path}: {error}")
         else:
-            duration, fingerprint = result
-            fingerprints.append((path, duration, fingerprint))
+            duration, fingerprint_type, fingerprint, decoded_signal = result
+            fingerprints.append((path, duration, fingerprint_type, fingerprint, decoded_signal))
     if failures:
         print("Warning: acoustic deduplication skipped for some files:")
         for failure in failures:
@@ -380,15 +407,32 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
         group = [representative[0]]
         unmatched = []
         for candidate in remaining:
-            duration_ratio = min(representative[1], candidate[1]) / max(
-                representative[1], candidate[1], 1.0
+            first_duration, second_duration = representative[1], candidate[1]
+            if first_duration <= 0 or second_duration <= 0:
+                unmatched.append(candidate)
+                continue
+            duration_ratio = min(first_duration, second_duration) / max(
+                first_duration, second_duration
             )
-            similarity = _chromaprint_similarity(representative[2], candidate[2])
-            if len(representative[2]) == 40:
-                match_threshold = 0.98
+            if duration_ratio < 0.80:
+                unmatched.append(candidate)
+                continue
+            if representative[2] != candidate[2]:
+                unmatched.append(candidate)
+                continue
+            if representative[2] == "decoded":
+                similarity = _decoded_feature_similarity(representative[3], candidate[3])
+                verified = (
+                    similarity >= 0.98
+                    and representative[4] is not None
+                    and candidate[4] is not None
+                    and _decoded_signal_similarity(representative[4], candidate[4]) >= 0.92
+                )
             else:
+                similarity = _chromaprint_similarity(representative[3], candidate[3])
                 match_threshold = CHROMAPRINT_SIMILARITY_THRESHOLD
-            if duration_ratio >= 0.80 and similarity >= match_threshold:
+                verified = similarity >= match_threshold
+            if verified:
                 group.append(candidate[0])
             else:
                 unmatched.append(candidate)
@@ -443,16 +487,7 @@ def main():
             if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
         ]
 
-        """ Build a set of duplicate paths to exclude """
-        duplicate_paths = set()
-        for paths in duplicates.values():
-            """Keep the last-updated file, treat the rest as duplicates"""
-            keeper = last_updated_file_from_duplicate(paths)
-            for p in paths:
-                if p.resolve() != keeper:
-                    duplicate_paths.add(p.resolve())
-
-        """Exclude duplicates and files that FFmpeg cannot fully decode."""
+        """Exclude files FFmpeg cannot fully decode before choosing keepers."""
         decodable_files = []
         corrupted_paths = []
         for path in all_audio_files:
@@ -460,6 +495,17 @@ def main():
                 decodable_files.append(path)
             else:
                 corrupted_paths.append(path)
+
+        decodable_resolved = {path.resolve() for path in decodable_files}
+        """ Build a set of duplicate paths to exclude """
+        duplicate_paths = set()
+        for paths in duplicates.values():
+            valid_paths = [p for p in paths if p.resolve() in decodable_resolved]
+            """Keep the last-updated decodable file, when available."""
+            keeper = last_updated_file_from_duplicate(valid_paths) if valid_paths else None
+            for p in valid_paths:
+                if p.resolve() != keeper:
+                    duplicate_paths.add(p.resolve())
 
         audio_file_set = [
             p.resolve() for p in decodable_files if p.resolve() not in duplicate_paths

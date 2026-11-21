@@ -73,13 +73,15 @@ container metadata, audio stream details, and audio/video stream counts. Missing
 FFprobe fields are recorded as `null` (or an empty tags object).
 
 Duplicate scanning first groups byte-identical files by SHA-256, then uses
-`fpcalc` fingerprints to compare the remaining files. Acoustic matches require
+`fpcalc` fingerprints to compare one representative from every SHA-256 group,
+including groups that already contain exact duplicates. Acoustic matches require
 at least 0.80 Chromaprint similarity and durations within 20% of each other.
 When Chromaprint produces no fingerprint (common for silence, very short clips,
-and synthetic tones), a strict decoded-audio signal comparison is used instead.
-Install `fpcalc` (provided by `libchromaprint-tools` on Ubuntu/Debian) for
-cross-format matching. If it is missing or cannot fingerprint a file, the scan
-reports a warning and still completes exact SHA-256 duplicate detection.
+and synthetic tones), normalized decoded-audio features shortlist candidates
+and an aligned signal comparison verifies them. Install `fpcalc` (provided by
+`libchromaprint-tools` on Ubuntu/Debian) for cross-format matching. A warning is
+reported only if both `fpcalc` and the decoded-audio fallback fail for a file;
+exact SHA-256 duplicate detection still completes.
 
 `PASS`, `REVIEW`, and `FAIL` are simple heuristics. They do not prove that a transcript is correct or that a recording is suitable for a particular model. Keep the original dataset unchanged.
 
