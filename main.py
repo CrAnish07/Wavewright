@@ -195,7 +195,7 @@ def chromaprint_command(path: Path) -> list[str]:
     return ["fpcalc", "-raw", "-json", "-length", "0", str(path.resolve())]
 
 
-def _read_chromaprint(path: Path) -> tuple[float, str, list[int], array | None]:
+def _read_chromaprint(path: Path) -> tuple[float, str, list[int], array | None, array | None]:
     """Generate a raw Chromaprint fingerprint using the fpcalc executable."""
     try:
         result = subprocess.run(
@@ -213,10 +213,10 @@ def _read_chromaprint(path: Path) -> tuple[float, str, list[int], array | None]:
         raise RuntimeError(f"Could not parse fpcalc output for {path}: {error}") from error
     if len(fingerprint) < CHROMAPRINT_MIN_FRAMES:
         raise RuntimeError(f"fpcalc returned a fingerprint that is too short for {path}")
-    return duration, "chromaprint", fingerprint, None
+    return duration, "chromaprint", fingerprint, None, None
 
 
-def _read_spectral_fingerprint(path: Path) -> tuple[float, str, list[float], array]:
+def _read_spectral_fingerprint(path: Path) -> tuple[float, str, list[float], array, array]:
     """Build a small decoded-audio fingerprint when Chromaprint has no result.
 
     This handles very short or synthetic material (for example pure test tones)
@@ -264,7 +264,7 @@ def _read_spectral_fingerprint(path: Path) -> tuple[float, str, list[float], arr
         feature.extend((rms / rms_scale if rms_scale else 0.0, crossings))
     # Keep a lightly downsampled waveform for a direct similarity check after
     # the coarse RMS/zero-crossing features identify a possible match.
-    return duration, "decoded", feature, samples[::8]
+    return duration, "decoded", feature, samples[::8], samples
 
 
 def _chromaprint_similarity(first: list[int], second: list[int]) -> float:
@@ -303,7 +303,10 @@ def _decoded_signal_similarity(first: array, second: array) -> float:
         return 0.0
     max_lag = min(138, max(0, overlap_size // 5))
     best = 0.0
-    for lag in range(-max_lag, max_lag + 1, 4):
+    lags = list(range(-max_lag, max_lag + 1, 4))
+    if 0 not in lags:
+        lags.append(0)
+    for lag in sorted(lags):
         start_a, start_b = max(0, lag), max(0, -lag)
         size = min(len(first) - start_a, len(second) - start_b)
         if size < overlap_size * 0.8:
@@ -373,7 +376,7 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     if not candidates:
         return duplicates
 
-    def fingerprint_file(path: Path) -> tuple[Path, tuple[float, str, list[int] | list[float], array | None] | None, str | None]:
+    def fingerprint_file(path: Path) -> tuple[Path, tuple[float, str, list[int] | list[float], array | None, array | None] | None, str | None]:
         try:
             return path, _read_chromaprint(path), None
         except RuntimeError as error:
@@ -385,14 +388,14 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
     with ThreadPoolExecutor(max_workers=min(max_workers, len(candidates))) as executor:
         fingerprint_results = list(executor.map(fingerprint_file, candidates))
 
-    fingerprints: list[tuple[Path, float, str, list[int] | list[float], array | None]] = []
+    fingerprints: list[tuple[Path, float, str, list[int] | list[float], array | None, array | None]] = []
     failures = []
     for path, result, error in fingerprint_results:
         if result is None:
             failures.append(f"{path}: {error}")
         else:
-            duration, fingerprint_type, fingerprint, decoded_signal = result
-            fingerprints.append((path, duration, fingerprint_type, fingerprint, decoded_signal))
+            duration, fingerprint_type, fingerprint, reduced_signal, full_signal = result
+            fingerprints.append((path, duration, fingerprint_type, fingerprint, reduced_signal, full_signal))
     if failures:
         print("Warning: acoustic deduplication skipped for some files:")
         for failure in failures:
@@ -427,6 +430,9 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
                     and representative[4] is not None
                     and candidate[4] is not None
                     and _decoded_signal_similarity(representative[4], candidate[4]) >= 0.92
+                    and representative[5] is not None
+                    and candidate[5] is not None
+                    and _decoded_signal_similarity(representative[5], candidate[5]) >= 0.92
                 )
             else:
                 similarity = _chromaprint_similarity(representative[3], candidate[3])
