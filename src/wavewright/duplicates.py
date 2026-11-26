@@ -103,15 +103,15 @@ def check_duplicate_waves(directory_path: str | Path) -> dict[str, list[Path]]:
         unmatched = []
         for candidate in remaining:
             first_duration, second_duration = representative[1], candidate[1]
-            if first_duration <= 0 or second_duration <= 0:
-                unmatched.append(candidate)
-                continue
-            duration_ratio = min(first_duration, second_duration) / max(
-                first_duration, second_duration
-            )
-            if duration_ratio < 0.80:
-                unmatched.append(candidate)
-                continue
+            # Unknown duration is not evidence of a mismatch. In particular,
+            # don't compare the fallback's 120-second decode cap as duration.
+            if first_duration > 0 and second_duration > 0:
+                duration_ratio = min(first_duration, second_duration) / max(
+                    first_duration, second_duration
+                )
+                if duration_ratio < 0.80:
+                    unmatched.append(candidate)
+                    continue
             if representative[2] != candidate[2]:
                 unmatched.append(candidate)
                 continue

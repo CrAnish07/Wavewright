@@ -16,6 +16,34 @@ def chromaprint_command(path: Path) -> list[str]:
     return ["fpcalc", "-raw", "-json", "-length", "0", str(path.resolve())]
 
 
+def _measure_full_duration(path: Path) -> float:
+    """Return the full audio duration, or 0.0 when it cannot be measured."""
+    command = [
+        "ffprobe", "-v", "error", "-show_entries",
+        "format=duration:stream=codec_type,duration", "-of", "json", str(path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            return 0.0
+        data = json.loads(result.stdout)
+        audio_durations = [
+            float(stream["duration"])
+            for stream in data.get("streams", [])
+            if stream.get("codec_type") == "audio" and stream.get("duration") is not None
+        ]
+        candidates = audio_durations or [data.get("format", {}).get("duration")]
+        for value in candidates:
+            if value is None:
+                continue
+            duration = float(value)
+            if math.isfinite(duration) and duration > 0:
+                return duration
+    except (FileNotFoundError, PermissionError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return 0.0
+
+
 def _read_chromaprint(path: Path) -> tuple[float, str, list[int], array | None, array | None]:
     """Generate a raw Chromaprint fingerprint using the fpcalc executable."""
     try:
@@ -61,7 +89,9 @@ def _read_spectral_fingerprint(path: Path) -> tuple[float, str, list[float], arr
         samples.byteswap()
     if len(samples) < 2048:
         raise RuntimeError(f"Not enough decoded audio for a fallback fingerprint: {path}")
-    duration = len(samples) / 11025
+    # The decoded waveform is capped above; use FFprobe for the full-file
+    # duration used by the duplicate matcher's duration-ratio check.
+    duration = _measure_full_duration(path)
     # Compare temporal RMS and zero-crossing summaries. These remain stable
     # across lossless and lossy encodings for short/simple signals.
     segment_count = 20
