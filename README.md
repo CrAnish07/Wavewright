@@ -35,6 +35,7 @@ Python dependencies:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Run
@@ -42,8 +43,23 @@ pip install -r requirements.txt
 Pass either a directory or a ZIP archive:
 
 ```bash
-python main.py --input ./audio_dataset --output ./dataset_report
-python main.py --input ./audio_dataset.zip --output ./dataset_report
+wavewright --input ./audio_dataset --output ./dataset_report
+```
+
+The legacy `python main.py --input ...` command remains available. The current
+scanner accepts a directory; ZIP input is planned but is not implemented yet.
+
+## Project layout
+
+```text
+src/wavewright/
+├── cli.py           # command-line arguments
+├── scanner.py       # end-to-end scan workflow
+├── audio_files.py   # audio extensions and FFmpeg checks
+├── metadata.py      # FFprobe metadata and JSON manifest
+├── fingerprints.py  # acoustic fingerprint generation and comparison
+└── duplicates.py    # exact and acoustic duplicate grouping
+tests/               # automated tests
 ```
 
 Optional `metadata.csv` can be placed anywhere inside the dataset. It should contain a `filename` or `path` column. Optional columns include `transcript`, `speaker_id`, and `language`.
